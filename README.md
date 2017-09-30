@@ -11,8 +11,8 @@ a reverse proxy for this so that an application can point to the load balancer, 
 and slave.
 
 # What
-Ok, so i use the config file to create a file /etc/nginx/tcpconf.d/toggle_[port] which needs to be included in the nginx.conf file like `include /etc/nginx/tcpconf.d/*;`
-This app will ping the master server until it fails to connect. At which point it will tell the slave server that it's now the master, update the toggle_[port] file to reflect
+Ok, so i use the config file to create a file `/etc/nginx/tcpconf.d/toggle_[port]` which needs to be included in the nginx.conf file like `include /etc/nginx/tcpconf.d/*;`
+This app will ping the master server until it fails to connect. At which point it will tell the slave server that it's now the master, update the `toggle_[port]` file to reflect
 this, then do an nginx reload.  Which will move the application over to the, still functioning, server that has a pretty close copy of all the cache/redis data. 
 It will continue to try to communicate with the old master until it's online again, in which case it will tell it that it's now the slave of the newly switched master.
 

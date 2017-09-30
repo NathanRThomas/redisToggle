@@ -29,7 +29,7 @@ import (
     "io/ioutil"
 )
 
-const API_VER = "0.1.0"
+const API_VER = "0.1.1"
 
 //---------------------------------------------------------------------------------------------------------------------------//
 //----- PRIVATE FUNCTIONS -------------------------------------------------------------------------------------------------//
@@ -48,30 +48,31 @@ func loadConfig (config *appConfig_t, fileLoc string) {
     }
 
     //validate the file makes sense
-    if len(config.Redis) == 0 {
-        log.Fatalln("No redis setups in the config file. Please see example config file")
-    }
-
     //validate each redis server config, we'll actually try to resolve them later
-    for idx, server := range(config.Redis) {
-        if len(server.Master.PublicIP) < 1 { config.Redis[idx].Master.PublicIP = server.Master.PrivateIP}
-        if len(server.Slave.PublicIP) < 1 { config.Redis[idx].Slave.PublicIP = server.Slave.PrivateIP}
-    }
+    if len(config.Master.PublicIP) < 1 { config.Master.PublicIP = config.Master.PrivateIP}
+    if len(config.Slave.PublicIP) < 1 { config.Slave.PublicIP = config.Slave.PrivateIP}
+    if len(config.Master.PrivateIP) < 1 { config.Master.PrivateIP = config.Master.PublicIP}
+    if len(config.Slave.PrivateIP) < 1 { config.Slave.PrivateIP = config.Slave.PublicIP}
 
-    for idx, server := range(config.Redis) {
-        if len(server.Master.PublicIP) < 7 { //not a real ip check, but we need something to verify it looks good
-            log.Fatalf("Master ip from redis server index %d appears invalid", idx)
-        }
-        if len(server.Slave.PublicIP) < 7 { //not a real ip check, but we need something to verify it looks good
-            log.Fatalf("Slave ip from redis server index %d appears invalid", idx)
-        }
-        if server.Master.Port < 1 {
-            log.Fatalf("Masterport from redis server index %d appears invalid", idx)
-        }
-        if server.Slave.Port < 1 {
-            log.Fatalf("Masterport from redis server index %d appears invalid", idx)
-        }
+    if len(config.Master.PublicIP) < 7 { //not a real ip check, but we need something to verify it looks good
+        log.Fatalln("Master ip from redis server appears invalid")
     }
+    if len(config.Slave.PublicIP) < 7 { //not a real ip check, but we need something to verify it looks good
+        log.Fatalln("Slave ip from redis server index appears invalid")
+    }
+    if config.Master.Port < 1 {
+        log.Fatalln("Masterport from redis server index appears invalid")
+    }
+    if config.Slave.Port < 1 {
+        log.Fatalln("Masterport from redis server index appears invalid")
+    }
+}
+
+func writeConfig (config *appConfig_t, fileLoc string) {
+    fmt.Println("writing new config")
+    byt, _ := json.Marshal(*config)
+    err := ioutil.WriteFile(fileLoc, byt, 0666)
+    if err != nil { log.Println(err) }
 }
 
 
@@ -105,8 +106,13 @@ func main() {
     //first we want to validate our config so that tasks can run when we schedule it to
     tasks.ValidateConfig()  //if we don't throw a fatal, then we can keep going here
 
+    //signals for quitting
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt, syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
+
+    //signal for switching master/slave
+    switchSignal := make(chan os.Signal, 1)
+    signal.Notify(switchSignal, syscall.SIGUSR1)
 	
 	wg := new(sync.WaitGroup)  //use this to control the exiting of everything
     wg.Add(1)   //add 1 to our group, we can do everything in the background using a single other thread
@@ -116,13 +122,8 @@ func main() {
 	
 	go func() {
         for range ticker.C {  //every time we "tick"
-			writeFlag := tasks.Check()    //main entry point
-
-            if writeFlag {
-                fmt.Println("writing new config")
-                byt, _ := json.Marshal(appConfig)
-                err := ioutil.WriteFile(*configFlag, byt, 0666)
-                if err != nil { log.Println(err) }
+			if tasks.Check() {    //main entry point
+                writeConfig (&appConfig, *configFlag)
             }
 		}
 	}()
@@ -138,6 +139,15 @@ func main() {
         wg.Done()   //if we're here it's cause the ticker is no more
 		//}
 	}()
+
+    go func() {
+        <-switchSignal
+
+        log.Println("Switching due to signal")
+        if tasks.Switch() {
+            writeConfig (&appConfig, *configFlag)
+        }
+    }()
 	
 	wg.Wait() //wait here until we get an exit ^C request
     log.Println("Toggle Toggle MuthaF*cker")
