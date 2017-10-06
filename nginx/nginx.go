@@ -35,8 +35,8 @@ type Nginx_c struct {
 /*! \brief This generates a string that represents the config file for nginx to pass requests to the upstream ip and port
 */
 func (n *Nginx_c) genStream (ip string, port int) ([]byte) {
-    return []byte(fmt.Sprintf("stream {\n\tupstream redis {\n\t\tserver %s:%d;\n\t}\n\n\tserver {\n\t\tlisten %d;\n\t\tproxy_pass redis;\n\t}\n}\n",
-        ip, port, port))
+    return []byte(fmt.Sprintf("\n\tupstream redis_%d {\n\t\tserver %s:%d;\n\t}\n\n\tserver {\n\t\tlisten %d;\n\t\tproxy_pass redis_%d;\n\t}\n\n",
+        port, ip, port, port, port))
 }
 
 func (n *Nginx_c) reload() {

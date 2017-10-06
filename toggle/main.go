@@ -10,6 +10,10 @@
     I've tested this and it appears it works well to coordinate quick switches using a loadbalancer and the redis
     instances are able to pick up where they left off and keep going
 
+    do a 
+    kill -10 pid
+    to cause this to switch between the master and slave
+
 *  2017-09-15 NT   Created
 _ = "breakpoint"
 */
