@@ -8,6 +8,8 @@ import (
     "fmt"
     "log"
     "time"
+    "encoding/json"
+    "net/http"
 
     "github.com/NathanRThomas/redisToggle/redis"
     "github.com/NathanRThomas/redisToggle/nginx"
@@ -91,7 +93,7 @@ func (t *tasks_c) ValidateConfig () {
     if t.checkRedis(t.Config.Master.PublicIP, t.Config.Master.Port) == false { log.Fatalln("Unable to validate Master server") }
     if t.checkRedis(t.Config.Slave.PublicIP, t.Config.Slave.Port) == false { log.Fatalln("Unable to validate Slave server") }
 
-    //if we're here, it's cuase things are good, so update the nginx config file to match our config
+    //if we're here, it's cause things are good, so update the nginx config file to match our config
     t.nginx.Set(t.Config.Master.PublicIP, t.Config.Master.Port)
 
     //now make sure the servers are correctly identified as master/slave
@@ -148,4 +150,45 @@ func (t *tasks_c) Switch () bool {
     }
 
     return false    //this is bad
+}
+
+/*! \brief This gets the current settings from the master ip and port for redis
+    This will return ip, port, error
+*/
+func (t *tasks_c) SlaveCheck (ip string, port int) (string, int, error) {
+    //we need to do a get request from the master to see what the settings are
+    req, err := http.NewRequest("GET", fmt.Sprintf("http://%s:%d", ip, port), nil)
+    if err != nil {
+        log.Printf("Slave request for master's data failed: %s:%d : %s\n", ip, port, err.Error())
+        return "", 0, err
+    }
+    
+    //req.Header.Set("X-Custom-Header", "myvalue")
+    req.Header.Set("Accept", "application/json")
+    client := &http.Client{}
+    
+    resp, err := client.Do(req)
+    if err != nil {
+        log.Printf("Slave request Failed: %s:%d : %s\n", ip, port, err.Error())
+        return "", 0, err
+    }
+    
+    defer resp.Body.Close()
+    
+    //fmt.Println("response Status:", resp.Status)
+    //fmt.Println("response Headers:", resp.Header)
+    //fmt.Println("response Body:", string(body))
+    
+    if resp.StatusCode > 299 {
+        log.Printf("Slave request Failed code : %d : %s:%d\n", resp.StatusCode, ip, port)
+        return "", 0, err
+    } else {
+        config := appConfig_t{}
+        err := json.NewDecoder(resp.Body).Decode(&config)   //unencode the object
+        if err == nil {
+            return config.Master.PrivateIP, config.Master.Port, nil //we got something
+        } else {
+            return "", 0, err   //this is bad
+        }
+    }
 }

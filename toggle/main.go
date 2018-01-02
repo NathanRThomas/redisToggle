@@ -14,7 +14,10 @@
     kill -10 pid
     to cause this to switch between the master and slave
 
-*  2017-09-15 NT   Created
+*   2017-09-15 NT   Created
+    2017-12-29 NT   Modified so there's a master who can be return a json of the current setup to a request
+                    Which allows a slave to copy the current master's setup
+                    This allows multiple load-balancers
 _ = "breakpoint"
 */
 
@@ -31,9 +34,13 @@ import (
 	"syscall"
 	"time"
     "io/ioutil"
+    "net/http"
+
+    "github.com/NathanRThomas/redisToggle/nginx"
 )
 
-const API_VER = "0.1.1"
+const API_VER = "0.2.0"
+var appConfig appConfig_t //create an instance of our app config
 
 //---------------------------------------------------------------------------------------------------------------------------//
 //----- PRIVATE FUNCTIONS -------------------------------------------------------------------------------------------------//
@@ -79,25 +86,83 @@ func writeConfig (config *appConfig_t, fileLoc string) {
     if err != nil { log.Println(err) }
 }
 
+func masterEndpoint(w http.ResponseWriter, r *http.Request) {
+    if r.Method == "OPTIONS" { return } //this is a "test" request sent by javascript to test if the call is valid, or something, so just ignore it
+    js, _ := json.Marshal(appConfig)
+    w.Write(js)
+}
+
 
 //-------------------------------------------------------------------------------------------------------------------------//
 //----- MAIN --------------------------------------------------------------------------------------------------------------//
 //-------------------------------------------------------------------------------------------------------------------------//
 
 func main() {
-    appConfig := appConfig_t {} //create an instance of our app config
-	log.SetFlags(log.LstdFlags | log.Lshortfile) //configure the logging for this application
+    log.SetFlags(log.LstdFlags | log.Lshortfile) //configure the logging for this application
 	
 	versionFlag := flag.Bool("v", false, "Returns the version")
-	intervalFlag := flag.Int("i", 10, "Interval in seconds to check if the master is alive")
+	intervalFlag := flag.Int("i", 5, "Interval in seconds to check if the master is alive")
     retryFlag := flag.Int("r", 2, "Interval in seconds to double check if the master is alive")
     configFlag := flag.String("c", "toggle.conf", "Location of the config file")
+    portFlag := flag.Int("p", 0, "Port for this master to return the current status. Also makes this act as a master")
+    slaveFlag := flag.Bool("slave", false, "Makes this instance run as a slave, only polls for changes, won't make them")
+    masterIPFlag := flag.String("master", "", "ip address of the master toggle service we're going to ask the settings of")
 	
 	flag.Parse()
 
 	if *versionFlag {
 		fmt.Printf("\nToggle Version: %s\n\n", API_VER)
 		os.Exit(0)
+    } 
+
+    defer log.Println("Toggle Toggle MuthaF*cker")
+    wg := new(sync.WaitGroup)  //use this to control the exiting of everything
+    wg.Add(1)   //add 1 to our group, we can do everything in the background using a single other thread
+    
+    //signals for quitting
+    c := make(chan os.Signal, 1)
+    signal.Notify(c, os.Interrupt, syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
+
+    //tickers for the tasks scheduled at intervals
+    ticker := time.NewTicker(time.Second * time.Duration(*intervalFlag))    //used for the master as well as the slave
+    
+    go func() { //handle exiting
+        <-c
+        //for sig := range c {
+        // sig is a ^C, handle it
+        log.Println("Toggle stopping")
+
+        ticker.Stop()   //this kills the above thread loop
+        wg.Done()   //if we're here it's cause the ticker is no more
+        //}
+    }()
+
+    if *slaveFlag {  //we're running as a slave, this is different.  
+        //We only poll the other server for the current master and copy the settings here
+        if *portFlag == 0 { log.Fatalln("Slave must have -p= set to the port the master is running on") }
+        if len(*masterIPFlag) < 7 { log.Fatalln("Master ip [--master=] appears invalid") }
+
+        //slave task
+        go func() {
+            lastIP := ""
+            lastPort := 0
+            tasks := tasks_c{}
+            nginx := nginx.Nginx_c{}
+
+            for range ticker.C {  //every time we "tick"
+                ip, port, err := tasks.SlaveCheck (*masterIPFlag, *portFlag)
+                if err == nil { //otherwise we ignore this
+                    if lastIP != ip || lastPort != port {
+                        log.Printf("Slave set config to %s:%d\n", ip, port)
+                        nginx.Set (ip, port)    //update nginx to reflect this new setup
+                        lastIP, lastPort = ip, port //it changed, so save it
+                    }
+                }
+            }
+        }()
+
+        wg.Wait() //wait here until we get an exit ^C request
+        os.Exit(0)  //we're done
 	} else if *intervalFlag < 1 {
         log.Fatalf("Interval time is invalid, must be greater than 0: %d\n", *intervalFlag)
     } else if *retryFlag < 1 {
@@ -110,38 +175,17 @@ func main() {
     //first we want to validate our config so that tasks can run when we schedule it to
     tasks.ValidateConfig()  //if we don't throw a fatal, then we can keep going here
 
-    //signals for quitting
-	c := make(chan os.Signal, 1)
-	signal.Notify(c, os.Interrupt, syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
-
     //signal for switching master/slave
     switchSignal := make(chan os.Signal, 1)
     signal.Notify(switchSignal, syscall.SIGUSR1)
 	
-	wg := new(sync.WaitGroup)  //use this to control the exiting of everything
-    wg.Add(1)   //add 1 to our group, we can do everything in the background using a single other thread
-	
-	//tickers for the tasks scheduled at intervals
-	ticker := time.NewTicker(time.Second * time.Duration(*intervalFlag))
-	
+    //master task
 	go func() {
         for range ticker.C {  //every time we "tick"
-			if tasks.Check() {    //main entry point
+            if tasks.Check() {    //main entry point
                 writeConfig (&appConfig, *configFlag)
             }
 		}
-	}()
-
-	//this stops the api listeners
-	go func() {
-		<-c
-		//for sig := range c {
-		// sig is a ^C, handle it
-		log.Println("Toggle stopping")
-
-        ticker.Stop()   //this kills the above thread loop
-        wg.Done()   //if we're here it's cause the ticker is no more
-		//}
 	}()
 
     go func() {
@@ -152,7 +196,14 @@ func main() {
             writeConfig (&appConfig, *configFlag)
         }
     }()
+
+    if *portFlag > 0 {
+        go func() {
+            log.Println("Toggle running as master on port : ", *portFlag)
+            http.HandleFunc("/", masterEndpoint)
+            http.ListenAndServe(fmt.Sprintf(":%d", *portFlag), nil)
+        }()
+    }
 	
 	wg.Wait() //wait here until we get an exit ^C request
-    log.Println("Toggle Toggle MuthaF*cker")
 }

@@ -70,6 +70,5 @@ func (n *Nginx_c) Set (ip string, port int) error {
             n.reload()//we need to get nginx to reload
         }
     }
-
     return nil
 }
