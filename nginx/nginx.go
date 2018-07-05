@@ -10,6 +10,8 @@ import (
     "os"
     "os/exec"
     "io/ioutil"
+    "bytes"
+    "text/template"
 )
 
   //-------------------------------------------------------------------------------------------------------------------------//
@@ -18,14 +20,26 @@ import (
 
 const nginx_dir     = "/etc/nginx"
 const nginx_tcp_dir = "tcpconf.d"
-const conf_file     = "toggle_"
+const conf_file     = "toggle"
+
+const upstreamProxy = `
+    upstream redis_{{.Port}} {
+        server {{.IP}}:{{.Port}};
+    }
+
+    server {
+        listen {{.Port}};
+        proxy_pass redis_{{.Port}};
+    }
+
+`
 
   //-------------------------------------------------------------------------------------------------------------------------//
  //----- STRUCT ------------------------------------------------------------------------------------------------------------//
 //-------------------------------------------------------------------------------------------------------------------------//
 
 type Nginx_c struct {
-
+    TestingFlag bool
 }
 
   //-------------------------------------------------------------------------------------------------------------------------//
@@ -34,9 +48,20 @@ type Nginx_c struct {
 
 /*! \brief This generates a string that represents the config file for nginx to pass requests to the upstream ip and port
 */
-func (n *Nginx_c) genStream (ip string, port int) ([]byte) {
-    return []byte(fmt.Sprintf("\n\tupstream redis_%d {\n\t\tserver %s:%d;\n\t}\n\n\tserver {\n\t\tlisten %d;\n\t\tproxy_pass redis_%d;\n\t}\n\n",
-        port, ip, port, port, port))
+func (n *Nginx_c) genStream (ip string, port int) string {
+    var data struct {
+        IP string
+        Port int
+    }
+    data.IP = ip
+    data.Port = port
+    
+    buf := new(bytes.Buffer)
+    err := template.Must(template.New("upstream").Parse(upstreamProxy)).Execute(buf, data)
+    if err != nil {
+        log.Println(err)
+    }
+    return buf.String()
 }
 
 func (n *Nginx_c) reload() {
@@ -58,15 +83,19 @@ func (n *Nginx_c) reload() {
 
 /*! \brief Main entry point, this handles setting of the nginx config file and ensuring it's enabled and nginx has it reloaded
 */
-func (n *Nginx_c) Set (ip string, port int) error {
+func (n *Nginx_c) Set (ip string, ports []int) error {
 
     err := os.MkdirAll(fmt.Sprintf("%s/%s", nginx_dir, nginx_tcp_dir), 0755)   //create the directory to store the config file in
 
     if err == nil { //we have a dir, now let's dump to file
-        fileName := fmt.Sprintf("%s/%s/%s%d", nginx_dir, nginx_tcp_dir, conf_file, port)
-        err := ioutil.WriteFile(fileName, n.genStream(ip, port), 0644)
+        fileName := fmt.Sprintf("%s/%s/%s", nginx_dir, nginx_tcp_dir, conf_file)
+        content := ""
+        for _, p := range ports {
+            content += n.genStream(ip, p)
+            ioutil.WriteFile(fileName, []byte(content), 0644)
+        }
 
-        if err == nil { //we wrote the config file
+        if err == nil && !n.TestingFlag { //we wrote the config file
             n.reload()//we need to get nginx to reload
         }
     }

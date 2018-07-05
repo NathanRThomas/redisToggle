@@ -18,7 +18,13 @@
     2017-12-29 NT   Modified so there's a master who can be return a json of the current setup to a request
                     Which allows a slave to copy the current master's setup
                     This allows multiple load-balancers
-_ = "breakpoint"
+
+2018-07-05  NT  
+    Redid config file and application to be a little more simple.  We know only have 2 servers, and they can have any number of
+    redis ports between them.  The concept is that if a server is bad, we assume that all ports are bad and we switch all of them
+
+    Also this will now attempt to set a value in the database, to ensure that the server is actually running as the master.  If it fails
+    to set the value, then it will attempt to re-instate that server/port as the master
 */
 
 package main
@@ -39,7 +45,7 @@ import (
     "github.com/NathanRThomas/redisToggle/nginx"
 )
 
-const API_VER = "0.2.0"
+const API_VER = "0.2.1"
 var appConfig appConfig_t //create an instance of our app config
 
 //---------------------------------------------------------------------------------------------------------------------------//
@@ -71,11 +77,8 @@ func loadConfig (config *appConfig_t, fileLoc string) {
     if len(config.Slave.PublicIP) < 7 { //not a real ip check, but we need something to verify it looks good
         log.Fatalln("Slave ip from redis server index appears invalid")
     }
-    if config.Master.Port < 1 {
-        log.Fatalln("Masterport from redis server index appears invalid")
-    }
-    if config.Slave.Port < 1 {
-        log.Fatalln("Masterport from redis server index appears invalid")
+    if len(config.Ports) < 1 {
+        log.Fatalln("No ports are setup in the config")
     }
 }
 
@@ -101,19 +104,24 @@ func main() {
     log.SetFlags(log.LstdFlags | log.Lshortfile) //configure the logging for this application
 	
 	versionFlag := flag.Bool("v", false, "Returns the version")
-	intervalFlag := flag.Int("i", 5, "Interval in seconds to check if the master is alive")
+	intervalFlag := flag.Int("i", 2, "Interval in seconds to check if the master is alive")
     retryFlag := flag.Int("r", 2, "Interval in seconds to double check if the master is alive")
     configFlag := flag.String("c", "toggle.conf", "Location of the config file")
     portFlag := flag.Int("p", 0, "Port for this master to return the current status. Also makes this act as a master")
     slaveFlag := flag.Bool("slave", false, "Makes this instance run as a slave, only polls for changes, won't make them")
     masterIPFlag := flag.String("master", "", "ip address of the master toggle service we're going to ask the settings of")
+    testFlag := flag.Bool("testing", false, "Creates the configs and writes to the log, but doesn't actually change anything.  Used for testing")
 	
 	flag.Parse()
 
 	if *versionFlag {
 		fmt.Printf("\nToggle Version: %s\n\n", API_VER)
 		os.Exit(0)
-    } 
+    } else if *intervalFlag < 1 {
+        log.Fatalf("Interval time is invalid, must be greater than 0: %d\n", *intervalFlag)
+    } else if *retryFlag < 1 {
+        log.Fatalf("retry time is invalid, must be greater than 0: %d\n", *intervalFlag)
+    }
 
     defer log.Println("Toggle Toggle MuthaF*cker")
     wg := new(sync.WaitGroup)  //use this to control the exiting of everything
@@ -145,32 +153,29 @@ func main() {
         //slave task
         go func() {
             lastIP := ""
-            lastPort := 0
             tasks := tasks_c{}
-            nginx := nginx.Nginx_c{}
+            nginx := nginx.Nginx_c{ TestingFlag: *testFlag }
 
             for range ticker.C {  //every time we "tick"
-                ip, port, err := tasks.SlaveCheck (*masterIPFlag, *portFlag)
+                config, err := tasks.SlaveCheck (*masterIPFlag, *portFlag)
                 if err == nil { //otherwise we ignore this
-                    if lastIP != ip || lastPort != port {
-                        log.Printf("Slave set config to %s:%d\n", ip, port)
-                        nginx.Set (ip, port)    //update nginx to reflect this new setup
-                        lastIP, lastPort = ip, port //it changed, so save it
+                    if lastIP != config.Master.PrivateIP {  //we've had a switch
+                        log.Printf("Slave set config to %s\n", config.Master.PrivateIP)
+                        nginx.Set (config.Master.PrivateIP, config.Ports)    //update nginx to reflect this new setup
+                        lastIP = config.Master.PrivateIP //it changed, so save it
                     }
+                } else {
+                    log.Println(err)    //we had an error
                 }
             }
         }()
 
         wg.Wait() //wait here until we get an exit ^C request
         os.Exit(0)  //we're done
-	} else if *intervalFlag < 1 {
-        log.Fatalf("Interval time is invalid, must be greater than 0: %d\n", *intervalFlag)
-    } else if *retryFlag < 1 {
-        log.Fatalf("retry time is invalid, must be greater than 0: %d\n", *intervalFlag)
-    }
+	}
 
 	loadConfig(&appConfig, *configFlag) //load our config file
-    tasks := tasks_c{Config: &appConfig, Retry: *retryFlag} //this "class" handles the actual work, we just need to call it when it's appropriate
+    tasks := tasks_c{Config: &appConfig, Retry: *retryFlag, TestingFlag: *testFlag} //this "class" handles the actual work, we just need to call it when it's appropriate
     
     //first we want to validate our config so that tasks can run when we schedule it to
     tasks.ValidateConfig()  //if we don't throw a fatal, then we can keep going here

@@ -22,18 +22,19 @@ import (
 type server_t struct {
     PublicIP    string  `json:"public_ip"`
     PrivateIP   string  `json:"private_ip"`
-    Port        int     `json:"port"`
 }
 
 //app config for what we're monitoring
 type appConfig_t  struct {
     Master  server_t  `json:"master"`
     Slave   server_t  `json:"slave"`
+    Ports   []int     `json:"ports"`
 }
 
 type tasks_c struct {
     Config  *appConfig_t
     Retry   int
+    TestingFlag bool
     nginx   nginx.Nginx_c
 }
 
@@ -41,11 +42,12 @@ type tasks_c struct {
  //----- PRIVATE FUNCTIONS -------------------------------------------------------------------------------------------------//
 //-------------------------------------------------------------------------------------------------------------------------//
 
-func (t *tasks_c) checkRedis (ip string, port int) bool {
-    r := redis.Redis_c {}   //init a class
+func (t *tasks_c) checkRedis (ip string, port int, masterFlag bool) bool {
+    r := redis.Redis_c { TestingFlag: t.TestingFlag }   //init a class
     err := r.Connect(ip, port)
     if err == nil {
-        err = r.Check()
+        defer r.Close()
+        err = r.Check(masterFlag)
     }
     
     if err == nil {
@@ -59,10 +61,11 @@ func (t *tasks_c) checkRedis (ip string, port int) bool {
 /*! \brief Tells the targer server who their new master is
 */
 func (t *tasks_c) slaveof (targetIP string, targetPort int, newMasterIP, newMasterPort string) error {
-    r := redis.Redis_c {}   //init a class
+    r := redis.Redis_c { TestingFlag: t.TestingFlag }   //init a class
     err := r.Connect(targetIP, targetPort)  //connect to the server
 
     if err == nil {
+        defer r.Close()
         err = r.Slaveof(newMasterIP, newMasterPort)   //update the server to let it know who the new master is
     }
     return err
@@ -71,11 +74,11 @@ func (t *tasks_c) slaveof (targetIP string, targetPort int, newMasterIP, newMast
 /*! \brief The goal here is to keep trying to tell the master that it's no longer the master
     When this fails it ques itself up to try again
 */
-func (t *tasks_c) masterToSlave (targetIP string, targetPort int, newMasterIP, newMasterPort string) {
-    err := t.slaveof(targetIP, targetPort, newMasterIP, newMasterPort)
+func (t *tasks_c) masterToSlave (targetIP, newMasterIP string, targetPort int) {
+    err := t.slaveof(targetIP, targetPort, newMasterIP, fmt.Sprintf("%d", targetPort))
     if err != nil { //didn't work
         time.Sleep(time.Second * 5) //sleep here, time is less important as whenever the server comes back online it will start to replicate where it left off
-        go t.masterToSlave (targetIP, targetPort, newMasterIP, newMasterPort)   //"recursive call", not actually recursive cause i was worried about a stack overflow
+        go t.masterToSlave (targetIP, newMasterIP, targetPort)   //"recursive call", not actually recursive cause i was worried about a stack overflow
     } else {
         log.Printf("Old master %s converted to slave of %s:%s", targetIP, newMasterIP, newMasterIP) //log that this completed
     }
@@ -86,42 +89,68 @@ func (t *tasks_c) masterToSlave (targetIP string, targetPort int, newMasterIP, n
 //-------------------------------------------------------------------------------------------------------------------------//
 
 /*! \brief Validates the config file.  Call this before you do a Check
-    This is intended to be called once at startup, this will validate that we can initially start communicating with all "servers"
-    we're expecting to be able to communicate with.  If anything isn't reachable it returns a fatal
+    This is intended to be called once at startup, this will validate that we can initially start communicating with at least the master server
+    We don't specifically care if we can't connect to the slave, although that is bad, we don't want that to prevent us from starting this service 
+    on account of a bad slave connection
 */
 func (t *tasks_c) ValidateConfig () {
-    if t.checkRedis(t.Config.Master.PublicIP, t.Config.Master.Port) == false { log.Fatalln("Unable to validate Master server") }
-    if t.checkRedis(t.Config.Slave.PublicIP, t.Config.Slave.Port) == false { log.Fatalln("Unable to validate Slave server") }
+    t.nginx.TestingFlag = t.TestingFlag //pass this down
 
-    //if we're here, it's cause things are good, so update the nginx config file to match our config
-    t.nginx.Set(t.Config.Master.PublicIP, t.Config.Master.Port)
+    allGood := true     //default to this
+    for _, port := range t.Config.Ports {
+        if t.checkRedis(t.Config.Master.PublicIP, port, true) == false {  //see if we can connect to the master
+            allGood = false
+            break   //we couldn't connect to one of the master ports
+        }
+    }
 
-    //now make sure the servers are correctly identified as master/slave
-    t.slaveof(t.Config.Master.PublicIP, t.Config.Master.Port, "no", "one")
-    t.slaveof(t.Config.Slave.PublicIP, t.Config.Slave.Port, t.Config.Master.PrivateIP, fmt.Sprintf("%d", t.Config.Master.Port))
-    
+    if !allGood {   //this didn't work, so now try to connect to the slave instead
+        for _, port := range t.Config.Ports {
+            if t.checkRedis(t.Config.Slave.PublicIP, port, false) == false {  //see if we can connect to the slave
+                //this is really bad, we couldn't successfully connect to the master or the slave, so we have to bail
+                log.Fatalf("Unable to connect to master or slave on port %d\n", port)
+            }
+        }
+    }
+
+    if !allGood {   //in this case we couldn't talk to the master, but we could talk to the slave, so we want to switch them
+        if !t.Switch() {
+            log.Fatalln("We were not able to convert the slave over to a master")
+        }
+    } else {
+        //if we're here, it's cuase things are good, so update the nginx config file to match our config
+        t.nginx.Set(t.Config.Master.PublicIP, t.Config.Ports)
+
+        //now make sure the servers are correctly identified as master/slave
+        for _, port := range t.Config.Ports {
+            t.slaveof(t.Config.Master.PublicIP, port, "no", "one")
+            t.slaveof(t.Config.Slave.PublicIP, port, t.Config.Master.PrivateIP, fmt.Sprintf("%d", port))
+        }
+    }
     log.Println("Config file validated")
 }
 
 /*! \brief Main entry point.  Call this and it will check and handle the switch if needed
 */
 func (t *tasks_c) Check () (ret bool) {
-    if t.checkRedis(t.Config.Master.PublicIP, t.Config.Master.Port) == false { //check the master first
-        //if we're here it's cause we couldn't connect with the master redis server
-        //we want to make sure we can connect with the slave as well, otherwise there's no point
-        if t.checkRedis(t.Config.Slave.PublicIP, t.Config.Slave.Port) {
-            //ok, so at this point we couldn't connect to the master, but we could the slave
-            //i like to be careful here, so i'm goign to try one more time for the master before we switch everything
-            //we passed in a -r flag to indicate the length of time to wait here before we check the master again
-            time.Sleep(time.Second * time.Duration(t.Retry))
+    for _, port := range t.Config.Ports {
+        if t.checkRedis(t.Config.Master.PublicIP, port, true) == false { //check the master first
+            //if we're here it's cause we couldn't connect with the master redis server
+            //we want to make sure we can connect with the slave as well, otherwise there's no point
+            if t.checkRedis(t.Config.Slave.PublicIP, port, false) {
+                //ok, so at this point we couldn't connect to the master, but we could the slave
+                //i like to be careful here, so i'm goign to try one more time for the master before we switch everything
+                //we passed in a -r flag to indicate the length of time to wait here before we check the master again
+                time.Sleep(time.Second * time.Duration(t.Retry))
 
-            if t.checkRedis(t.Config.Master.PublicIP, t.Config.Master.Port) == false {
-                //ok, let's switch
-                log.Printf("Switching away from old master at %s:%d\n", t.Config.Master.PublicIP, t.Config.Master.Port)
-                ret = t.Switch()    //this actually handles switching
+                if t.checkRedis(t.Config.Master.PublicIP, port, true) == false {
+                    //ok, let's switch
+                    log.Printf("Switching away from old master at %s:%d\n", t.Config.Master.PublicIP, port)
+                    ret = t.Switch()    //this actually handles switching
+                }
+            } else {
+                log.Println("Lost connection to both master and slave")
             }
-        } else {
-            log.Println("Lost connection to both master and slave")
         }
     }
     return
@@ -134,33 +163,39 @@ func (t *tasks_c) Check () (ret bool) {
     and of course once that's done we want to update our config file to reflect the fact that the master and slave has switched
 */
 func (t *tasks_c) Switch () bool {
-    err := t.slaveof(t.Config.Slave.PublicIP, t.Config.Slave.Port, "no", "one")   //special no one for indicating it's a master
+    var err error
+    for _, port := range t.Config.Ports {
+        err = t.slaveof(t.Config.Slave.PublicIP, port, "no", "one")   //special no one for indicating it's a master
+        if err == nil {
+            //now we need to keep trying to talk to the master server and to let it know it's no longer the master
+            t.masterToSlave(t.Config.Master.PublicIP, t.Config.Slave.PrivateIP, port)
+        } else {
+            break   //don't do anymore, we're done
+        }
+    }
+
     if err == nil { //if this worked, then we're committed
         //now update ngnix
-        t.nginx.Set(t.Config.Slave.PublicIP, t.Config.Slave.Port)
+        t.nginx.Set(t.Config.Slave.PublicIP, t.Config.Ports)
 
-        //now we need to keep trying to talk to the master server and to let it know it's no longer the master
-        t.masterToSlave(t.Config.Master.PublicIP, t.Config.Master.Port, t.Config.Slave.PrivateIP, fmt.Sprintf("%d", t.Config.Slave.Port))
-
-        log.Printf("Switch completed to new master at %s:%d\n", t.Config.Slave.PublicIP, t.Config.Slave.Port)  //we're done
+        log.Printf("Switch completed to new master at %s\n", t.Config.Slave.PublicIP)  //we're done
         t.Config.Master, t.Config.Slave = t.Config.Slave, t.Config.Master   //switch the values so we know which is the master and which is the slave now
         return true //indicates we need to write this new update to the config file
     } else {
         log.Printf("Unable to promote slave to master, we're in bad shape: %s \n", err.Error()) //this is really bad
     }
-
     return false    //this is bad
 }
 
 /*! \brief This gets the current settings from the master ip and port for redis
     This will return ip, port, error
 */
-func (t *tasks_c) SlaveCheck (ip string, port int) (string, int, error) {
+func (t *tasks_c) SlaveCheck (ip string, port int) (config appConfig_t, err error) {
     //we need to do a get request from the master to see what the settings are
     req, err := http.NewRequest("GET", fmt.Sprintf("http://%s:%d", ip, port), nil)
     if err != nil {
         log.Printf("Slave request for master's data failed: %s:%d : %s\n", ip, port, err.Error())
-        return "", 0, err
+        return
     }
     
     //req.Header.Set("X-Custom-Header", "myvalue")
@@ -170,7 +205,7 @@ func (t *tasks_c) SlaveCheck (ip string, port int) (string, int, error) {
     resp, err := client.Do(req)
     if err != nil {
         log.Printf("Slave request Failed: %s:%d : %s\n", ip, port, err.Error())
-        return "", 0, err
+        return
     }
     
     defer resp.Body.Close()
@@ -180,15 +215,9 @@ func (t *tasks_c) SlaveCheck (ip string, port int) (string, int, error) {
     //fmt.Println("response Body:", string(body))
     
     if resp.StatusCode > 299 {
-        log.Printf("Slave request Failed code : %d : %s:%d\n", resp.StatusCode, ip, port)
-        return "", 0, err
+        err = fmt.Errorf("Slave request Failed code : %d : %s:%d\n", resp.StatusCode, ip, port)
     } else {
-        config := appConfig_t{}
-        err := json.NewDecoder(resp.Body).Decode(&config)   //unencode the object
-        if err == nil {
-            return config.Master.PrivateIP, config.Master.Port, nil //we got something
-        } else {
-            return "", 0, err   //this is bad
-        }
+        err = json.NewDecoder(resp.Body).Decode(&config)   //unencode the object
     }
+    return  //for better or worse, we're done
 }
