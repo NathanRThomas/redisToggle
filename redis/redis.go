@@ -6,6 +6,7 @@ package redis
 
 import (
 	"fmt"
+    "time"
 	"github.com/mediocregopher/radix.v2/pool"
 )
 
@@ -28,6 +29,11 @@ func (r Redis_c) ping () bool {
         return false
     }
 }
+
+func (r Redis_c) set (key, val string) error {
+    return r.cachePool.Cmd("SET", key, val).Err
+}
+
 //-------------------------------------------------------------------------------------------------------------------------//
 //----- INIT FUNCTIONS ----------------------------------------------------------------------------------------------------//
 //-------------------------------------------------------------------------------------------------------------------------//
@@ -43,9 +49,18 @@ func (r *Redis_c) Connect (ip string, port int) (err error) {
 
 /*! \brief Sets up all the connection pools that we'll need in the future
 */
-func (r *Redis_c) Check() (error) {
+func (r *Redis_c) Check(masterFlag bool) (error) {
     //do a ping to make sure we got what we expected
     if r.ping() {
+        if masterFlag {
+            //ping worked, now let's see if we can set things as we expect this to be the master
+            if err := r.set("toggle_toggle", time.Now().Format("2006-01-02 16:04:05")); err != nil {
+                //if ping works but set doesn't, assume we had a fail over and need to reset this as the master
+                fmt.Println("Master unable to be written to, resetting slave of no one")
+                return r.Slaveof ("no", "one")  //return this if it errors
+            }
+        }
+
         return nil  //we're good
     } else {
         return fmt.Errorf("Unable to 'ping' redis server")

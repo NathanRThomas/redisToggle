@@ -15,7 +15,13 @@
     to cause this to switch between the master and slave
 
 *  2017-09-15 NT   Created
-_ = "breakpoint"
+
+2018-07-05  NT  
+    Redid config file and application to be a little more simple.  We know only have 2 servers, and they can have any number of
+    redis ports between them.  The concept is that if a server is bad, we assume that all ports are bad and we switch all of them
+
+    Also this will now attempt to set a value in the database, to ensure that the server is actually running as the master.  If it fails
+    to set the value, then it will attempt to re-instate that server/port as the master
 */
 
 package main
@@ -33,7 +39,7 @@ import (
     "io/ioutil"
 )
 
-const API_VER = "0.1.1"
+const API_VER = "0.1.2"
 
 //---------------------------------------------------------------------------------------------------------------------------//
 //----- PRIVATE FUNCTIONS -------------------------------------------------------------------------------------------------//
@@ -64,11 +70,8 @@ func loadConfig (config *appConfig_t, fileLoc string) {
     if len(config.Slave.PublicIP) < 7 { //not a real ip check, but we need something to verify it looks good
         log.Fatalln("Slave ip from redis server index appears invalid")
     }
-    if config.Master.Port < 1 {
-        log.Fatalln("Masterport from redis server index appears invalid")
-    }
-    if config.Slave.Port < 1 {
-        log.Fatalln("Masterport from redis server index appears invalid")
+    if len(config.Ports) < 1 {
+        log.Fatalln("No ports are setup in the config")
     }
 }
 
@@ -89,7 +92,7 @@ func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile) //configure the logging for this application
 	
 	versionFlag := flag.Bool("v", false, "Returns the version")
-	intervalFlag := flag.Int("i", 10, "Interval in seconds to check if the master is alive")
+	intervalFlag := flag.Int("i", 2, "Interval in seconds to check if the master is alive")
     retryFlag := flag.Int("r", 2, "Interval in seconds to double check if the master is alive")
     configFlag := flag.String("c", "toggle.conf", "Location of the config file")
 	
