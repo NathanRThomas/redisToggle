@@ -50,15 +50,15 @@ func (r *Redis_c) Connect (ip string, port int) (err error) {
 
 /*! \brief Sets up all the connection pools that we'll need in the future
 */
-func (r *Redis_c) Check(masterFlag bool) (error) {
+func (r *Redis_c) Check(mainFlag bool) (error) {
     //do a ping to make sure we got what we expected
     if r.ping() {
-        if masterFlag {
-            //ping worked, now let's see if we can set things as we expect this to be the master
+        if mainFlag {
+            //ping worked, now let's see if we can set things as we expect this to be the main
             if err := r.set("toggle_toggle", time.Now().Format("2006-01-02 15:04:05")); err != nil {
-                //if ping works but set doesn't, assume we had a fail over and need to reset this as the master
-                fmt.Println("Master unable to be written to, resetting slave of no one")
-                return r.Slaveof ("no", "one")  //return this if it errors
+                //if ping works but set doesn't, assume we had a fail over and need to reset this as the main
+                fmt.Println("Main unable to be written to, resetting subordinate of no one")
+                return r.Subordinateof ("no", "one")  //return this if it errors
             }
         }
 
@@ -68,9 +68,9 @@ func (r *Redis_c) Check(masterFlag bool) (error) {
     }
 }
 
-/*! \brief Tells the redis server who it should be a slave of
+/*! \brief Tells the redis server who it should be a subordinate of
 */
-func (r *Redis_c) Slaveof (ip, port string) (error) {
+func (r *Redis_c) Subordinateof (ip, port string) (error) {
     if r.TestingFlag { return nil } //just testing
     _, err := r.cachePool.Cmd("SLAVEOF", ip, port).Bytes()
     return err
